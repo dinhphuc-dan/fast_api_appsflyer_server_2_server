@@ -2,11 +2,28 @@ import logging
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-from utilities import load_logger, check_kafka_server, check_production_args, ValidPath
+from functools import wraps
+from utilities import load_logger, ValidPath, check_production_args
 
 import uvicorn
 from pyngrok import ngrok
 from kafka.admin import KafkaAdminClient, NewTopic
+
+
+def check_kafka_server(func):
+    """a decorator to check kafka connection"""
+
+    @wraps(func)
+    def decorated(*args, **kwargs):
+        try:
+            kafka_server = KafkaAdminClient(
+                bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+            )
+            return func(kafka_server=kafka_server, *args, **kwargs)
+        except Exception as e:
+            raise e
+
+    return decorated
 
 
 @check_kafka_server

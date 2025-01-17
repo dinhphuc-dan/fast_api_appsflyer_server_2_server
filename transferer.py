@@ -2,152 +2,225 @@ import logging
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-from utilities import (
-    load_logger,
-    check_production_args,
-    create_postgres_database_and_table,
-)
+from utilities import *
 
-from pydantic import BaseModel
 from transferer_kafka_spark_streaming import KafkaSparkStreaming
+from sqlalchemy import URL, Engine
+from sqlmodel import create_engine, SQLModel, inspect, Session, Column, text
+from sqlalchemy.sql import sqltypes
+from sqlmodel.sql.sqltypes import AutoString
+from sqlalchemy.sql.sqltypes import Integer, Float, Date, DateTime, Boolean
+
+from pyspark.sql import DataFrame, types
+from pyspark.sql import functions as spark_func
+from pyspark.sql.functions import pandas_udf
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    IntegerType,
+    FloatType,
+    DateType,
+    DayTimeIntervalType,
+    BooleanType,
+)
+import pandas as pd
 
 
-class AppsflyerS2SMessage(BaseModel):
-    idfv: str | None
-    device_category: str | None
-    store_product_page: str | None
-    af_sub1: str | None
-    customer_user_id: str | None
-    is_lat: str | None
-    contributor_2_engagement_type: str | None
-    contributor_2_af_prt: str | None
-    bundle_id: str | None
-    gp_broadcast_referrer: str | None
-    contributor_2_touch_time: str | None
-    contributor_3_touch_type: str | None
-    event_source: str | None
-    af_cost_value: str | None
-    contributor_1_match_type: str | None
-    app_version: str | None
-    contributor_3_af_prt: str | None
-    custom_data: str | None
-    contributor_2_touch_type: str | None
-    gp_install_begin: str | None
-    city: str | None
-    amazon_aid: str | None
-    device_model: str | None
-    gp_referrer: str | None
-    contributor_1_engagement_type: str | None
-    af_cost_model: str | None
-    af_c_id: str | None
-    attributed_touch_time_selected_timezone: str | None
-    selected_currency: str | None
-    app_name: str | None
-    install_time_selected_timezone: str | None
-    postal_code: str | None
-    wifi: str | None
-    install_time: str | None
-    engagement_type: str | None
-    operator: str | None
-    attributed_touch_type: str | None
-    af_attribution_lookback: str | None
-    campaign_type: str | None
-    keyword_match_type: str | None
-    af_adset_id: str | None
-    device_download_time_selected_timezone: str | None
-    contributor_2_media_source: str | None
-    conversion_type: str | None
-    contributor_2_match_type: str | None
-    ad_personalization_enabled: str | None
-    api_version: str | None
-    attributed_touch_time: str | None
-    revenue_in_selected_currency: str | None
-    is_retargeting: str | None
-    country_code: str | None
-    gp_click_time: str | None
-    contributor_1_af_prt: str | None
-    match_type: str | None
-    event_type: str | None
-    appsflyer_id: str | None
-    dma: str | None
-    http_referrer: str | None
-    af_sub5: str | None
-    af_prt: str | None
-    event_revenue_currency: str | None
-    store_reinstall: str | None
-    install_app_store: str | None
-    media_source: str | None
-    deeplink_url: str | None
-    campaign: str | None
-    af_keywords: str | None
-    region: str | None
-    cost_in_selected_currency: str | None
-    event_value: dict | None
-    ip: str | None
-    oaid: str | None
-    event_time: str | None
-    is_receipt_validated: str | None
-    contributor_1_campaign: str | None
-    ad_user_data_enabled: str | None
-    af_sub4: str | None
-    imei: str | None
-    contributor_3_campaign: str | None
-    event_revenue_usd: str | None
-    af_sub2: str | None
-    original_url: str | None
-    contributor_2_campaign: str | None
-    android_id: str | None
-    contributor_3_media_source: str | None
-    af_adset: str | None
-    contributor_3_engagement_type: str | None
-    af_ad: str | None
-    state: str | None
-    network_account_id: str | None
-    device_type: str | None
-    idfa: str | None
-    retargeting_conversion_type: str | None
-    af_channel: str | None
-    af_cost_currency: str | None
-    contributor_1_media_source: str | None
-    custom_dimension: str | None
-    keyword_id: str | None
-    device_download_time: str | None
-    contributor_1_touch_type: str | None
-    af_reengagement_window: str | None
-    raw_consent_data: str | None
-    af_siteid: str | None
-    language: str | None
-    app_id: str | None
-    contributor_1_touch_time: str | None
-    event_revenue: str | None
-    af_ad_type: str | None
-    carrier: str | None
-    event_name: str | None
-    af_sub_siteid: str | None
-    advertising_id: str | None
-    gdpr_applies: str | None
-    os_version: str | None
-    platform: str | None
-    af_sub3: str | None
-    contributor_3_match_type: str | None
-    selected_timezone: str | None
-    af_ad_id: str | None
-    contributor_3_touch_time: str | None
-    user_agent: str | None
-    is_primary_attribution: str | None
-    sdk_version: str | None
-    event_time_selected_timezone: str | None
-
-
-class Transferer:
+class Transferer(KafkaSparkStreaming):
     """
-    This class aim to check data quality and transfer good data to good_data tables
-    While it detects bad data, it will write all unqualified data to a single table name bad_data
-    Dad data is the records that are not aligned with the predefined schema
+    This class hold connection to postgres and kafka, which aims to check data quality while streaming
+    If it detects bad data, which is not aligned with the predefined schema, it will write all unqualified data to a single table name bad_data
+    Otherwise, it will record to a table name with relevant path
     """
 
-    def __init__() -> None:
-        pass
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.postgres_engine = self._create_postgres_engine()
+        self.create_postgres_tables_and_add_new_columns()
+
+    def _create_postgres_engine(self) -> Engine:
+        postgres_url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            host=os.getenv("POSTGRES_HOST"),
+            port=os.getenv("POSTGRES_PORT"),
+            database=os.getenv("POSTGRES_DB"),
+        )
+        return create_engine(postgres_url)
+
+    def _init_all_database_if_not_exist(self):
+        """
+        Return
+            None. But create all database if not exists
+        """
+        SQLModel.metadata.create_all(self.postgres_engine)
+
+    def _getting_input_tables(self) -> list[dict]:
+        """
+        Return:
+            list of dictionary contains expected table and its column object from sqlalchemy,
+            ex [{"table_1": ["sqlalchemy.sql.schema.Column_1", "sqlalchemy.sql.schema.Column_2"]}]
+        """
+        input_tables = []
+        for table_name in SQLModel.metadata.tables.keys():
+            list_columns = SQLModel.metadata.tables[table_name].columns.values()
+            input_tables.append({table_name: list_columns})
+        return input_tables
+
+    def _getting_existing_tables(self) -> list[dict]:
+        """
+        Return:
+            list of dictionary contains existing table and its column name, ex [{"table_1": ["id", "name"]}]
+        """
+        existing_tables = []
+        for table_name in inspect(self.postgres_engine).get_table_names():
+            list_columns_name = inspect(self.postgres_engine).get_columns(table_name)
+            existing_tables.append({table_name: list_columns_name})
+        return existing_tables
+
+    def _getting_collums_to_add(self) -> list[Column]:
+        """
+        Return:
+            list of columns to add to database
+        """
+        input_schemas = self._getting_input_tables()
+        output_schemas = self._getting_existing_tables()
+        list_columns_to_add = []
+        for input_table in input_schemas:
+            for output_table in output_schemas:
+                if list(input_table.keys())[0] == list(output_table.keys())[0]:
+                    for input_column in list(input_table.values())[0]:
+                        if input_column.name not in [
+                            output_column["name"]
+                            for output_column in list(output_table.values())[0]
+                        ]:
+                            list_columns_to_add.append(input_column)
+
+        return list_columns_to_add
+
+    def create_postgres_tables_and_add_new_columns(self):
+        """
+        Return:
+            None. But it creates all tables based on input if not exists or add new columns if there is a schema change
+        """
+        try:
+            self._init_all_database_if_not_exist()
+            list_columns_to_alter = self._getting_collums_to_add()
+            if list_columns_to_alter:
+                with Session(self.postgres_engine) as session:
+                    for column in list_columns_to_alter:
+                        sql_text = f"alter table {column.table} add column {column.name} {column.type}"
+                        session.exec(statement=text(sql_text))
+                        session.commit()
+                        logger.info(
+                            f"added column {column.name} to table {column.table}"
+                        )
+
+            else:
+                logger.info("No columns to alter")
+        except Exception as e:
+            raise e
+
+    def _convert_table_schema_to_dataframe_schema(self, table_name: str) -> StructType:
+        """
+        Arguments:
+            table_name: a SQLModel table name defined in utilities.py
+        Return:
+            - List of column name and type to be used in spark json schema
+            - List of required columns name to help detect null row
+                ex, StructType(
+                    [
+                        StructField("json_col1", StringType(), True),
+                        StructField("json_col2", IntegerType(), False),
+                    ]
+                And ["json_col1", "json_col2"]
+        """
+        json_schema = StructType()
+        list_required_columns: list[str] = []
+        for table in self._getting_input_tables():
+            if list(table.keys())[0] == table_name:
+                for column in list(table.values())[0]:
+                    if not column.primary_key:
+                        json_schema.add(
+                            column.name,
+                            self._convert_datatype_from_sqlmodel_to_spark(column.type),
+                            column.nullable,
+                        )
+                        if not column.nullable:
+                            list_required_columns.append(column.name)
+                return json_schema, list_required_columns
+
+    def _convert_datatype_from_sqlmodel_to_spark(self, input_type: sqltypes) -> types:
+        """
+        Arguments:
+            input_types: a sql data types
+        Return:
+            output_types: an spark data types.
+        """
+        if type(input_type) == Integer:
+            output_type = IntegerType()
+        elif type(input_type) == Float:
+            output_type = FloatType()
+        elif type(input_type) == Date:
+            output_type = DateType()
+        elif type(input_type) == DateTime:
+            output_type = DayTimeIntervalType()
+        elif type(input_type) == Boolean:
+            output_type = BooleanType()
+        else:
+            output_type = StringType()
+        return output_type
+
+    def transform_data_from_kafka_topic(
+        self, df: DataFrame, table_name: str
+    ) -> DataFrame:
+        """
+        Arguments:
+            df: Spark DataFrame
+            table_name: table destination name
+        Return:
+            df: a dataframe which normalize all json data with table predesigned schema, and a required_fields columns for checking null
+
+        """
+        json_schema, list_required_columns = (
+            self._convert_table_schema_to_dataframe_schema(table_name=table_name)
+        )
+        return df.withColumn(
+            "json_data",
+            spark_func.from_json(spark_func.expr("CAST(value as STRING)"), json_schema),
+        ).select(
+            "*",
+            "json_data.*",
+            spark_func.concat(*list_required_columns).alias("required_fields"),
+        )
+
+    def detect_good_data_based_on_schema_validation(self, df: DataFrame) -> DataFrame:
+        """
+        Arguments:
+            df: a spark dataframe with required_fields
+        Return:
+            good_df: a spark dataframe which contains row that validate table schema
+        """
+        good_df = df.filter(df["required_fields"].isNotNull()).select("json_data.*")
+        return good_df
+
+    def detect_bad_data_based_on_schema_validation(self, df: DataFrame) -> DataFrame:
+        """
+        Arguments:
+            df: a spark dataframe with required_fields
+        Return:
+            bad_df: a spark dataframe which contains row that NOT validate table schema, and its error reason
+        """
+        required_field_error_reason = "Required fields are missing"
+        bad_df = df.filter(df["required_fields"].isNull()).select(
+            spark_func.expr("CAST(value as STRING)").alias("json_data_string"),
+            spark_func.lit(required_field_error_reason).alias("error_reason"),
+            spark_func.expr("CAST(key as STRING)").alias("path"),
+            spark_func.current_timestamp().alias("event_time"),
+        )
+        return bad_df
 
 
 if __name__ == "__main__":
@@ -157,8 +230,36 @@ if __name__ == "__main__":
         pass
     else:
         load_dotenv(dotenv_path=Path(".env.dev"), override=True, verbose=True)
+        basic_transferer = Transferer()
 
-        stream = KafkaSparkStreaming()
-        df = stream.read_from_one_kafka_topic("appsflyer-s2s")
-        query = stream.write_to_console(df=df)
-        query.awaitTermination()
+        kafka_df = basic_transferer.read_from_one_kafka_topic(
+            os.getenv("TRANSFERER_SOURCE"), read_method="stream"
+        )
+        # kafka_df.show()
+        # kafka_df.printSchema()
+        transformed_df = basic_transferer.transform_data_from_kafka_topic(
+            df=kafka_df, table_name=os.getenv("TRANSFERER_SOURCE").replace("-", "")
+        )
+        good_df = basic_transferer.detect_good_data_based_on_schema_validation(
+            transformed_df
+        )
+
+        # good_df.printSchema()
+
+        bad_df = basic_transferer.detect_bad_data_based_on_schema_validation(
+            transformed_df
+        )
+
+        # bad_df.printSchema()
+
+        good_query = basic_transferer.write_to_postgres(
+            df=good_df,
+            table_name=os.getenv("TRANSFERER_SOURCE").replace("-", ""),
+            checkpoint_location="./good_data_checkpoint",
+        )
+        bad_query = basic_transferer.write_to_postgres(
+            df=bad_df,
+            table_name="baddatatable",
+            checkpoint_location="./bad_data_checkpoint",
+        )
+        basic_transferer.spark_session.streams.awaitAnyTermination()
